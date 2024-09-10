@@ -2,14 +2,14 @@
 #![allow(unknown_lints)]
 
 use fallible_iterator::FallibleIterator;
-use gimli::{Section, UnitHeader, UnitOffset, UnitSectionOffset, UnitType, UnwindSection};
+use gimli::{DebugStrOffset, Section, UnitHeader, UnitOffset, UnitSectionOffset, UnitType, UnwindSection};
 use object::{Object, ObjectSection};
 use regex::bytes::Regex;
 use std::borrow::Cow;
 use std::cmp;
 use std::collections::HashMap;
 use std::env;
-use std::fmt::{self, Debug};
+use std::fmt::{self, format, Debug};
 use std::fs;
 use std::io;
 use std::io::{BufWriter, Write};
@@ -18,7 +18,7 @@ use std::process;
 use std::result;
 use std::sync::{Condvar, Mutex};
 use typed_arena::Arena;
-
+use std::fs::File;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Error {
     Gimli(gimli::Error),
@@ -434,7 +434,7 @@ fn load_file_section<'input, 'arena, Endian: gimli::Endianity>(
     Ok(Relocate::new(section, relocations))
 }
 
-fn dump_file<Endian>(file: &object::File, endian: Endian, flags: &Flags) -> Result<()>
+fn dump_file<Endian, W: Write + Send>(file: &object::File, w: &mut BufWriter<W>, endian: Endian, flags: &Flags) -> Result<()>
 where
     Endian: gimli::Endianity + Send + Sync,
 {
@@ -489,7 +489,7 @@ where
         )
     };
 
-    let w = &mut BufWriter::new(io::stdout());
+    // let w = &mut BufWriter::new(io::stdout());
     if flags.dwp {
         let empty_relocations = arena_relocations.alloc(RelocationMap::default());
         let empty = Relocate::new(gimli::EndianSlice::new(&[], endian), empty_relocations);
@@ -1192,11 +1192,21 @@ fn dump_entries<R: Reader, W: Write>(
     Ok(())
 }
 
+// Try to retrieve a string from the debug_str section for a given offset
+fn from_dbg_str_ref<R: Reader>(dwarf: &gimli::Dwarf<R>, str_ref: DebugStrOffset<usize>) -> Option<String> {
+    if let Ok(str_ref) = dwarf.debug_str.get_str(str_ref) {
+        let str_ref = str_ref.to_string_lossy();        
+        // return Some(str_ref.to_string());
+        Some(format!("{:?}", str_ref));
+    }
+    None
+}
+
 fn dump_attr_value<R: Reader, W: Write>(
     w: &mut W,
     attr: &gimli::Attribute<R>,
     unit: gimli::UnitRef<R>,
-) -> Result<()> {
+) -> Result<()> {    
     let value = attr.value();
     match value {
         gimli::AttributeValue::Addr(address) => {
@@ -1291,10 +1301,90 @@ fn dump_attr_value<R: Reader, W: Write>(
             writeln!(w, "{:#x}", address)?;
         }
         gimli::AttributeValue::UnitRef(offset) => {
-            write!(w, "0x{:08x}", offset.0)?;
+            write!(w, "0x{:08x}", offset.0)?;            
             match offset.to_unit_section_offset(&unit) {
-                UnitSectionOffset::DebugInfoOffset(goff) => {
+                UnitSectionOffset::DebugInfoOffset(goff) => {                    
                     write!(w, "<.debug_info+0x{:08x}>", goff.0)?;
+                    if attr.name() == gimli::DW_AT_type {
+                        let entry = unit.entry(offset)?;                        
+                        write!(w, "|{}", entry.tag())?;
+                        let mut attrs = entry.attrs();
+                        while let Ok(Some(attr)) = attrs.next() {                            
+                            if attr.name() == gimli::DW_AT_name {
+                                let type_name = match attr.value() {
+                                    gimli::AttributeValue::String(str) => {
+                                        if let Ok(str) = str.to_string() {
+                                            Some(str.to_string())
+                                        } else {
+                                            Some(format!("_2"))
+                                        }
+                                    }
+                                    gimli::AttributeValue::DebugStrRef(strref) => {
+                                        from_dbg_str_ref(&unit.dwarf, strref)
+                                    }
+                                    _ => { Some(format!("_1")) }
+                                };
+                                match type_name {
+                                    Some(name) => {
+                                        write!(w, "|{}", name)?;                                        
+                                    }
+                                    None => {                                        
+                                    }
+                                }
+                            }                            
+                        }                        
+                    }
+                    // let get_entry_name = |unit: &gimli::UnitRef<R>, offset| {
+                    //     let dwarf = unit.dwarf;
+                    //     let entry = unit.entry(offset);
+                    //     match entry {
+                    //         Ok(entry) => {
+                    //             while let Ok(Some(attr)) = &entry.attrs().next() {
+                    //                 if attr.name() == gimli::DW_AT_name {
+                    //                     match attr.value() {
+                    //                         gimli::AttributeValue::String(str) => {
+                    //                             if let Ok(str) = str.to_string() {
+                    //                                 return Some(str.to_string())
+                    //                             }
+                    //                         }
+                    //                         gimli::AttributeValue::DebugStrRef(strref) => {
+                    //                             return from_dbg_str_ref(dwarf, strref)
+                    //                         }
+                    //                         _ => { }
+                    //                     };
+                    //                 }
+                    //             }       
+                    //         }
+                    //         Err(err) => {
+                    //             // writeln!(w, "Failed to get attributes: {:?}", err)?;
+                    //             println!("Failed to get attributes: {:?}", err);
+                    //         }
+                    //     }                        
+                    //     None
+                    // };
+                    // let name = get_entry_name(&unit, offset);
+
+                    // let mut entries = {
+                    //     match unit.entry(offset) {
+                    //         Ok(entries) => entries,
+                    //         _ => { panic!("get entries failed"); }
+                    //     }
+                    // };
+                    // while let Ok(Some((_, entry))) = entries.next_dfs() {
+                    //     let tag = entry.tag();
+                    //     writeln!(w, "tag: {}", tag)?;
+                    //     if entry.tag() != gimli::DW_TAG_member {
+                    //         break;
+                    //     }
+                        // if tag == gimli::DW_TAG_class_type {
+                        //     let attrs = entry.attrs();
+                        //     while let Ok(Some(attr)) = attrs.next() {
+                        //         let name = attr.name();
+                        //         let value = attr.value();
+                        //         writeln!(w, "{}: {:?}", name, value)?;
+                        //     }
+                        // }
+                    // }
                 }
                 UnitSectionOffset::DebugTypesOffset(goff) => {
                     write!(w, "<.debug_types+0x{:08x}>", goff.0)?;
@@ -2238,4 +2328,12 @@ fn dump_aranges<R: Reader, W: Write>(
         }
     }
     Ok(())
+}
+
+
+/// Represents a location of some type/tag in the DWARF information
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Location {
+    pub header: gimli::DebugInfoOffset,
+    pub offset: gimli::UnitOffset,
 }
