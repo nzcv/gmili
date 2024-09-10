@@ -381,10 +381,21 @@ fn main() {
         } else {
             gimli::RunTimeEndian::Big
         };
-        let ret = dump_file(&file, endian, &flags);
+        let w = &mut BufWriter::new(File::create("output1.txt").unwrap());
+        let ret = dump_file(&file, w, endian, &flags);
         match ret {
             Ok(_) => (),
             Err(err) => eprintln!("Failed to dump '{}': {}", file_path, err,),
+        }
+
+        {
+            let w = &mut BufWriter::new(File::create("output.txt").unwrap());
+            flags.raw = true;
+            let ret = dump_file(&file, w, endian, &flags);
+            match ret {
+                Ok(_) => (),
+                Err(err) => eprintln!("Failed to dump '{}': {}", file_path, err,),
+            }
         }
     }
 }
